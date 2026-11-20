@@ -28,7 +28,15 @@ class LocalStore {
 
     _database = await openDatabase(
       path,
-      version: 1,
+      version: 2,
+      onUpgrade: (database, oldVersion, newVersion) async {
+        // Pending messages in v1 of this database were addressed to the old
+        // local relay. They must never be forwarded to the shared class room.
+        if (oldVersion < 2) {
+          await database.delete('outbox');
+          await database.execute('CREATE TABLE IF NOT EXISTS own_ids (id TEXT PRIMARY KEY)');
+        }
+      },
       onConfigure: (database) async {
         await database.execute('PRAGMA secure_delete = ON');
 
@@ -70,6 +78,7 @@ class LocalStore {
           )
         ''');
 
+        await database.execute('CREATE TABLE own_ids (id TEXT PRIMARY KEY)');
         // This table never stores message text.
         await database.execute('''
           CREATE TABLE seen_ids (
@@ -94,7 +103,7 @@ class LocalStore {
 
     // Conservative cold-start rule:
     // do not restore previously accepted message bodies.
-    // Unsent/in-flight outbox entries remain for reconciliation.
+    // Waiting rows retain a 30-second TTL; uncertain attempts are discarded by the client.
     await db.delete('messages');
   }
 
@@ -129,10 +138,11 @@ class LocalStore {
   Future<void> enqueue({
     required String id,
     required String text,
+    required int createdAt,
   }) async {
     final trimmed = text.trim();
 
-    if (trimmed.isEmpty || text.length > 500) {
+    if (trimmed.isEmpty || text.runes.length > 500) {
       throw ArgumentError('Message must be 1–500 characters.');
     }
 
@@ -148,12 +158,14 @@ class LocalStore {
         throw StateError('queue_full');
       }
 
+      await transaction.insert('own_ids', {'id': id},
+        conflictAlgorithm: ConflictAlgorithm.ignore);
       await transaction.insert('outbox', {
         'id': id,
         'text': trimmed,
         'state': 'waiting',
         'attempted_epoch': null,
-        'created_at_local': DateTime.now().millisecondsSinceEpoch,
+        'created_at_local': createdAt,
       });
     });
   }
@@ -287,12 +299,18 @@ class LocalStore {
     await db.delete('messages');
   }
 
-  Future<void> removeOldSeenIds(String currentEpoch) async {
-    await db.delete(
-      'seen_ids',
-      where: 'relay_epoch != ?',
-      whereArgs: [currentEpoch],
-    );
+  Future<int> discardUncertain() => db.delete('outbox',
+    where: 'state = ?', whereArgs: ['in_flight']);
+
+  Future<bool> isOwnId(String id) async {
+    final rows = await db.query('own_ids', columns: ['id'],
+      where: 'id = ?', whereArgs: [id], limit: 1);
+    return rows.isNotEmpty;
+  }
+
+  Future<void> rememberId(String id, String scope, int expiresAt) async {
+    await db.insert('seen_ids', {'id': id, 'relay_epoch': scope,
+      'expires_at': expiresAt}, conflictAlgorithm: ConflictAlgorithm.ignore);
   }
 
   Future<void> close() async {

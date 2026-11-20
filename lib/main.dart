@@ -12,8 +12,10 @@ const backgroundColor = Color(0xFFF6F8FC);
 const headingColor = Color(0xFF14213D);
 const secondaryColor = Color(0xFF526176);
 
-// Chrome and relay must currently run on the same laptop.
-const relayAddress = 'ws://10.30.28.169:8081';
+// Sawaira's proposed protocol v1. Use only with the class-approved relay.
+const relayAddress = 'wss://vanish-relay-sawaira.bonto.page/ws';
+// This is a local namespace, NOT a server epoch (v1 has no epoch field).
+const protocolScope = 'sawaira-v1';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -65,7 +67,7 @@ class LiveMessage {
   final String senderName;
   final String text;
   final int deadline;
-  final Set<String> recipients = {};
+  int? deliveryCount;
 
   LiveMessage({
     required this.id,
@@ -77,14 +79,15 @@ class LiveMessage {
 }
 
 class VanishHome extends StatefulWidget {
-  const VanishHome({super.key});
+  final LocalStore? store;
+const VanishHome({super.key, this.store});
 
   @override
   State<VanishHome> createState() => _VanishHomeState();
 }
 
 class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
-  final _store = LocalStore();
+  late final LocalStore _store = widget.store ?? LocalStore();
   final _uuid = const Uuid();
   final _elapsed = Stopwatch()..start();
 
@@ -93,7 +96,9 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
   final _formKey = GlobalKey<FormState>();
 
   final _messages = <LiveMessage>[];
-  final _pings = <String, int>{};
+  final _pendingDeadlines = <String, int>{};
+  bool _purging = false;
+  bool _retryEnabled = false;
 
   List<Map<String, Object?>> _outbox = [];
 
@@ -125,14 +130,15 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
   String _deviceId = '';
   String _displayName = '';
   String _notice = '';
-  String? _epoch;
+
   String? _flightId;
 
   int _generation = 0;
   int _serverSample = 0;
   int _sampleTick = 0;
-  int _bestRtt = 1 << 30;
-  int _lastPong = 0;
+
+  Timer? _pongDeadline;
+  int? _earlyDeliveryCount;
   int _retrySeconds = 1;
 
   int get _tick => _elapsed.elapsedMilliseconds;
@@ -180,7 +186,8 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
     try {
       await _store.open();
       final profile = await _store.loadProfile();
-      final pending = await _store.loadOutbox();
+      final uncertain = await _store.discardUncertain();
+      await _purgeWaiting();
 
       if (!mounted) return;
 
@@ -188,11 +195,22 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
       _displayName = profile['display_name'] as String;
       _name.text = _displayName;
       _hasJoinedBefore = profile['has_joined'] == 1;
-      _outbox = pending;
+      if (uncertain > 0) _notice = 'Delivery outcome unknown; not resent.';
       _ready = true;
 
       _ticker = Timer.periodic(const Duration(milliseconds: 250), (_) {
-        if (!_foreground || _messages.isEmpty) return;
+        if (!_foreground) return;
+        if (!_purging && _outbox.any(_waitingExpired)) {
+          _purging = true;
+          _background(() async {
+            try {
+              await _purgeWaiting();
+            } finally {
+              _purging = false;
+            }
+          });
+        }
+        if (_messages.isEmpty) return;
 
         // Hide expired content immediately, then clean storage.
         final expired = _messages
@@ -231,6 +249,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
 
     _ticker?.cancel();
     _heartbeat?.cancel();
+    _pongDeadline?.cancel();
     _connectTimeout?.cancel();
     _retry?.cancel();
     _flightTimeout?.cancel();
@@ -268,14 +287,9 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
         !_foreground) {
       _foreground = true;
       _clockReady = false;
-      _bestRtt = 1 << 30;
-      _pings.clear();
-
-      if (_connected) {
-        _sendPing();
-        _sendPing();
-        _sendPing();
-      } else if (_joined && !_manualOffline && !_connecting) {
+      // v1 pong carries no clock. Rejoin to obtain a fresh welcome time.
+      if (!_manualOffline && (_joined || _retryEnabled)) {
+        _lost(_generation, 'Refreshing relay time.', retry: false);
         _connect();
       }
 
@@ -314,6 +328,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
         _notice = 'Offline mode. New messages will wait on this device.';
       } else {
         _manualOffline = false;
+        _retryEnabled = true;
         await _connect();
       }
     } catch (_) {
@@ -325,7 +340,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
   }
 
   Future<void> _connect() async {
-    if (_disposed || _connecting || _manualOffline) return;
+    if (_disposed || !_foreground || _connecting || _manualOffline) return;
 
     _retry?.cancel();
 
@@ -334,14 +349,13 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
     _connecting = true;
     _connected = false;
     _clockReady = false;
-    _bestRtt = 1 << 30;
-    _pings.clear();
+
     _notice = '';
     _redraw();
 
     _connectTimeout?.cancel();
     _connectTimeout = Timer(
-      const Duration(seconds: 10),
+      const Duration(seconds: 75),
       () => _lost(generation, 'Connection timed out.'),
     );
 
@@ -354,18 +368,12 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
       final channel = WebSocketChannel.connect(Uri.parse(relayAddress));
 
       _channel = channel;
-      await channel.ready;
-
-      if (_disposed || generation != _generation) {
-        await channel.sink.close();
-        return;
-      }
-
       _subscription = channel.stream.listen(
         (raw) {
+          final receivedTick = _tick;
           _background(() async {
             if (generation == _generation) {
-              await _handle(raw);
+              await _handle(raw, receivedTick);
             }
           });
         },
@@ -378,11 +386,13 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
         cancelOnError: true,
       );
 
+      await channel.ready;
+      if (_disposed || generation != _generation) return;
       _write({
         'type': 'join',
-        'version': 'dev-v1',
+        'protocol': 1,
         'device_id': _deviceId,
-        'display_name': _displayName,
+        'name': _displayName,
       });
     } catch (_) {
       _lost(generation, 'Could not connect to the relay.');
@@ -396,6 +406,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
 
     _connectTimeout?.cancel();
     _heartbeat?.cancel();
+    _pongDeadline?.cancel();
     _flightTimeout?.cancel();
     _subscription?.cancel();
     _channel?.sink.close();
@@ -405,20 +416,25 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
     _connecting = false;
     _clockReady = false;
     _flightId = null;
-    _messages.clear();
-    _pings.clear();
+    _earlyDeliveryCount = null;
+
     _notice = reason;
     _redraw();
 
     if (_ready) {
-      _background(() => _store.clearAcceptedMessages());
+      _background(() async {
+        final uncertain = await _store.discardUncertain();
+        if (uncertain > 0) _notice = 'Delivery outcome unknown; not resent.';
+        await _reloadOutbox();
+        _redraw();
+      });
     }
 
-    if (retry && _joined && !_manualOffline) {
+    if (retry && _retryEnabled && !_manualOffline) {
       _retry?.cancel();
 
       final delay = _retrySeconds;
-      _retrySeconds = (_retrySeconds * 2).clamp(1, 10).toInt();
+      _retrySeconds = (_retrySeconds * 2).clamp(1, 8).toInt();
 
       _retry = Timer(Duration(seconds: delay), () {
         if (!_disposed && !_manualOffline) _connect();
@@ -426,21 +442,25 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
     }
   }
 
+  void _armPongDeadline() {
+    _pongDeadline?.cancel();
+    final generation = _generation;
+    _pongDeadline = Timer(const Duration(seconds: 30), () {
+      _lost(generation, 'Heartbeat timed out. Reconnecting...');
+    });
+  }
+
   void _sendPing() {
     if (!_connected) return;
 
-    final nonce = _uuid.v4();
-    _pings.removeWhere((_, value) => _tick - value > 30000);
-    _pings[nonce] = _tick;
-
     try {
-      _write({'type': 'ping', 'nonce': nonce});
+      _write({'type': 'ping'});
     } catch (_) {
       _lost(_generation, 'Connection lost.');
     }
   }
 
-  Future<void> _handle(dynamic raw) async {
+  Future<void> _handle(dynamic raw, int receivedTick) async {
     Map<String, dynamic> event;
 
     try {
@@ -456,92 +476,49 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
 
     switch (event['type']) {
       case 'welcome':
-        if (event['version'] != 'dev-v1' || event['relay_epoch'] is! String) {
-          _lost(
-            _generation,
-            'Protocol mismatch. Expected dev-v1.',
-            retry: false,
-          );
+        if (event['protocol'] != 1 || event['server_time'] is! int) {
+          _lost(_generation, 'Protocol mismatch. Expected protocol 1.', retry: false);
           return;
         }
-
-        _epoch = event['relay_epoch'] as String;
+        if (!_foreground) return;
+        // Equivalent to server_time - phone_time offset at welcome, but
+        // advanced using a monotonic stopwatch so wall-clock edits cannot
+        // change an active countdown. Network delay is not measurable here.
+        _serverSample = event['server_time'] as int;
+        _sampleTick = receivedTick;
+        _clockReady = true;
         _connected = true;
-        _lastPong = _tick;
-
-        await _store.removeOldSeenIds(_epoch!);
-
-        _sendPing();
-        _sendPing();
-        _sendPing();
-
-        _heartbeat?.cancel();
-        _heartbeat = Timer.periodic(const Duration(seconds: 10), (_) {
-          if (_tick - _lastPong > 25000) {
-            _lost(_generation, 'Connection timed out.');
-          } else {
-            _sendPing();
-          }
-        });
-        break;
-
-      case 'pong':
-        final sentTick = _pings.remove(event['nonce']);
-        final serverTime = event['server_now'];
-
-        if (sentTick == null || serverTime is! int) return;
-
-        final received = _tick;
-        final rtt = received - sentTick;
-        _lastPong = received;
-
-        if (!_clockReady || rtt <= _bestRtt) {
-          _bestRtt = rtt;
-          _serverSample = serverTime + rtt ~/ 2;
-          _sampleTick = received;
-        }
-
-        final becameClockReady = !_clockReady && _foreground;
-        _clockReady = _foreground;
-        if (becameClockReady && _flightId != null) {
-          // An acceptance may have arrived during clock synchronisation.
-          // Reconcile its existing ID instead of deleting or resending it.
-          _flightTimeout?.cancel();
-          _flightId = null;
-        }
         _connecting = false;
         _joined = true;
+        _retryEnabled = true;
         _retrySeconds = 1;
+        _armPongDeadline();
         _connectTimeout?.cancel();
-
+        _heartbeat?.cancel();
+        _heartbeat = Timer.periodic(const Duration(seconds: 15), (_) => _sendPing());
         if (!_hasJoinedBefore) {
           await _store.markJoined();
           _hasJoinedBefore = true;
         }
-
         await _advanceQueue();
         break;
 
-      case 'accepted':
-        await _handleAccepted(event);
+      case 'pong':
+        if (_connected) _armPongDeadline();
         break;
 
       case 'message':
-        await _handleMessage(event);
+        if (_connected) await _handleMessage(event);
         break;
 
-      case 'status_result':
-        await _handleStatus(event);
-        break;
-
-      case 'receipt':
+      case 'delivered':
         final id = event['id'];
-        final recipient = event['recipient_device_id'];
-
-        if (id is String && recipient is String) {
+        final count = event['count'];
+        if (id is String && count is int && count >= 0) {
+          if (id == _flightId) _earlyDeliveryCount = count;
           for (final message in _messages) {
             if (message.id == id && message.senderId == _deviceId) {
-              message.recipients.add(recipient);
+              message.deliveryCount = count;
             }
           }
         }
@@ -552,6 +529,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
 
         if (id is String) {
           _messages.removeWhere((message) => message.id == id);
+          await _store.rememberId(id, protocolScope, 0);
           await _store.removeExpiredMessage(id);
           _finishFlight(id);
           await _reloadOutbox();
@@ -565,8 +543,22 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
             ? event['message'] as String
             : 'The relay rejected a request.';
 
-        // Stop automatic retries for protocol/server rejections.
-        // Preserve in-flight data until its outcome can be checked.
+        if (code == 'not_joined') {
+          _lost(_generation, 'Session ended. Rejoining the class...');
+          return;
+        }
+        final rejected = _flightId;
+        if (code == 'bad_message' && rejected != null) {
+          // There is exactly one outstanding send on this connection.
+          await _store.discardOutboxItem(rejected);
+          _finishFlight(rejected);
+          _notice = message;
+          await _reloadOutbox();
+          await _advanceQueue();
+          break;
+        }
+        // Configuration errors require user action before retrying.
+        _retryEnabled = false;
         _manualOffline = _joined;
         _lost(
           _generation,
@@ -574,8 +566,8 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
           retry: false,
         );
 
-        if (code == 'unsupported_version') {
-          _notice = 'Protocol mismatch. Expected dev-v1.';
+        if (code == 'bad_protocol') {
+          _notice = 'Protocol mismatch. Expected protocol 1.';
         }
         break;
     }
@@ -585,6 +577,33 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
 
   Future<void> _reloadOutbox() async {
     _outbox = await _store.loadOutbox();
+    final ids = _outbox.map((row) => row['id'] as String).toSet();
+    _pendingDeadlines.removeWhere((id, _) => !ids.contains(id));
+    final wallNow = DateTime.now().millisecondsSinceEpoch;
+    for (final row in _outbox) {
+      final id = row['id'] as String;
+      final age = wallNow - (row['created_at_local'] as int);
+      // Across process restarts only wall time is available offline.
+      // Reject future-dated rows on rollback rather than extend their TTL.
+      _pendingDeadlines.putIfAbsent(id,
+        () => _tick + (age < 0 ? 0 : (30000 - age).clamp(0, 30000).toInt()));
+    }
+  }
+
+  bool _waitingExpired(Map<String, Object?> row) =>
+      row['state'] == 'waiting' && (_pendingDeadlines[row['id']] ?? 0) <= _tick;
+
+  Future<void> _purgeWaiting() async {
+    await _reloadOutbox();
+    final expired = _outbox.where(_waitingExpired).toList();
+    for (final row in expired) {
+      await _store.cancelWaiting(row['id'] as String);
+    }
+    if (expired.isNotEmpty) {
+      _notice = 'Unsent messages older than 30 seconds were dropped.';
+      await _reloadOutbox();
+      _redraw();
+    }
   }
 
   void _finishFlight(String id) {
@@ -598,72 +617,61 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
     _flightTimeout?.cancel();
     final generation = _generation;
 
-    _flightTimeout = Timer(const Duration(seconds: 12), () {
+    _flightTimeout = Timer(const Duration(seconds: 30), () {
       if (_flightId == id && generation == _generation) {
         _lost(
           generation,
-          'Confirmation timed out. Delivery will be checked '
-          'before retrying.',
+          'Delivery outcome unknown; not resent.',
         );
       }
     });
   }
 
-  // Starts at most one send/status operation at a time.
+  // The proposal has no acceptance-status query. One attempted send is
+  // persisted before writing, and is NEVER automatically sent a second time.
   Future<void> _advanceQueue() async {
-    if (!_canDrain || _flightId != null || _epoch == null) return;
-
+    if (!_canDrain || _flightId != null) return;
     final generation = _generation;
-    await _reloadOutbox();
-
+    await _purgeWaiting();
     while (_outbox.isNotEmpty && _canDrain && generation == _generation) {
       final item = _outbox.first;
       final id = item['id'] as String;
-
       if (item['state'] == 'in_flight') {
-        if (item['attempted_epoch'] != _epoch) {
-          // An in-memory relay restart loses acceptance history.
-          // Do not blindly resend an uncertain message.
-          await _store.discardOutboxItem(id);
-          _notice = 'Delivery outcome unknown; not resent.';
-          await _reloadOutbox();
-          continue;
-        }
-
-        _flightId = id;
-
-        try {
-          _write({'type': 'status', 'id': id});
-          _watchFlight(id);
-        } catch (_) {
-          _lost(_generation, 'Connection lost.');
-        }
-
-        return;
+        await _store.discardOutboxItem(id);
+        _notice = 'Delivery outcome unknown; not resent.';
+        await _reloadOutbox();
+        continue;
       }
-
-      final claimed = await _store.markInFlight(id, _epoch!);
-      await _reloadOutbox();
-
-      if (!claimed) continue;
-
+      if ((_pendingDeadlines[id] ?? 0) <= _tick) {
+        await _purgeWaiting();
+        continue;
+      }
+      final claimed = await _store.markInFlight(id, protocolScope);
+      if (!claimed) {
+        await _reloadOutbox();
+        continue;
+      }
       if (!_canDrain || generation != _generation) {
-        // It was marked in-flight but not transmitted.
-        // Restore Waiting so reconnect can handle it safely.
         await _store.markWaiting(id);
         await _reloadOutbox();
         return;
       }
-
+      // Recheck after the database await, immediately before transmission.
+      if ((_pendingDeadlines[id] ?? 0) <= _tick) {
+        await _store.discardOutboxItem(id);
+        await _reloadOutbox();
+        continue;
+      }
+      _earlyDeliveryCount = null;
       _flightId = id;
-
       try {
-        _write({'type': 'send', 'id': id, 'text': item['text']});
+        _write({'type': 'message', 'id': id, 'sender': _displayName,
+          'text': item['text']});
         _watchFlight(id);
       } catch (_) {
-        _lost(_generation, 'Connection lost.');
+        _lost(_generation, 'Delivery outcome unknown; not resent.');
       }
-
+      await _reloadOutbox();
       return;
     }
   }
@@ -674,114 +682,33 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
         (event['expires_at'] as int) - (event['sent_at'] as int) == 30000;
   }
 
-  Future<void> _handleAccepted(Map<String, dynamic> event) async {
-    final id = event['id'];
-
-    if (id is! String ||
-        event['relay_epoch'] != _epoch ||
-        !_validTimes(event)) {
-      return;
-    }
-
-    // Unknown time is NOT proof of expiry. Keep the durable in-flight
-    // body until a pong lets us ask status for the same message ID.
-    if (!_foreground || !_clockReady) {
-      if (_foreground) {
-        _notice = 'Checking message time before displaying your send…';
-        _sendPing();
-      }
-      return;
-    }
-
-    await _reloadOutbox();
-
-    final matching = _outbox.where((row) => row['id'] == id);
-
-    if (matching.isNotEmpty) {
-      final pending = matching.first;
-
-      await _recordMessage(
-        id: id,
-        senderId: _deviceId,
-        senderName: _displayName,
-        text: pending['text'] as String,
-        sentAt: event['sent_at'] as int,
-        expiresAt: event['expires_at'] as int,
-      );
-    }
-
-    // A lifecycle change can happen during a database await.
-    if (!_foreground || !_clockReady) return;
-
-    _finishFlight(id);
-    await _reloadOutbox();
-    _redraw();
-    await _advanceQueue();
-  }
-
-  Future<void> _handleStatus(Map<String, dynamic> event) async {
-    final id = event['id'];
-
-    if (id is! String || id != _flightId || event['relay_epoch'] != _epoch) {
-      return;
-    }
-
-    switch (event['result']) {
-      case 'accepted':
-        await _handleAccepted(event);
-        return;
-
-      case 'expired':
-        await _store.removeExpiredMessage(id);
-        _messages.removeWhere((message) => message.id == id);
-        break;
-
-      case 'unknown':
-        // Same relay epoch confirms it has never accepted this ID.
-        // Retry using the SAME message ID.
-        await _store.markWaiting(id);
-        break;
-
-      default:
-        return;
-    }
-
-    _finishFlight(id);
-    await _reloadOutbox();
-    await _advanceQueue();
-  }
-
   Future<void> _handleMessage(Map<String, dynamic> event) async {
+    final id = event['id'];
     final sender = event['sender'];
-
-    if (event['id'] is! String ||
-        event['text'] is! String ||
-        sender is! Map ||
-        sender['device_id'] is! String ||
-        sender['display_name'] is! String ||
-        event['relay_epoch'] != _epoch ||
-        !_validTimes(event)) {
-      return;
-    }
-
-    final text = event['text'] as String;
-    if (text.isEmpty || text.length > 500) return;
-
-    final id = event['id'] as String;
-    final senderId = sender['device_id'] as String;
-
-    final displayed = await _recordMessage(
-      id: id,
-      senderId: senderId,
-      senderName: sender['display_name'] as String,
-      text: text,
-      sentAt: event['sent_at'] as int,
+    final text = event['text'];
+    if (id is! String || id.isEmpty || sender is! String ||
+        sender.trim().isEmpty || text is! String || text.isEmpty ||
+        text.runes.length > 500 || !_validTimes(event)) return;
+    // Names are not unique. Match our own sends by their durable UUIDs.
+    final own = await _store.isOwnId(id);
+    await _recordMessage(
+      id: id, senderId: own ? _deviceId : '', senderName: sender,
+      text: text, sentAt: event['sent_at'] as int,
       expiresAt: event['expires_at'] as int,
     );
-
-    if (displayed && senderId != _deviceId && _connected) {
-      _write({'type': 'delivered', 'id': id});
+    if (own) {
+      if (id == _flightId && _earlyDeliveryCount != null) {
+        for (final message in _messages) {
+          if (message.id == id) message.deliveryCount = _earlyDeliveryCount;
+        }
+        _earlyDeliveryCount = null;
+      }
+      await _store.discardOutboxItem(id);
+      _finishFlight(id);
+      await _reloadOutbox();
+      await _advanceQueue();
     }
+    // v1 sends delivered/count FROM the relay. No client delivered event.
   }
 
   Future<bool> _recordMessage({
@@ -799,7 +726,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
     if (await _store.hasSeen(id)) return false;
     if (!_foreground || !_clockReady) return false;
 
-    final epoch = _epoch!;
+    const epoch = protocolScope;
     final remaining = expiresAt - _serverNow;
 
     // Only a trusted deadline (or the explicit capacity limit) drops
@@ -859,14 +786,19 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
   Future<void> _queueMessage() async {
     final text = _draft.text.trim();
 
-    if (_saving || text.isEmpty || text.length > 500) return;
+    if (_saving || text.isEmpty || text.runes.length > 500) return;
 
     _saving = true;
     _redraw();
+    final id = _uuid.v4();
+    final createdAt = DateTime.now().millisecondsSinceEpoch;
+    final queueDeadline = _tick + 30000;
 
     try {
       await _serial(() async {
-        await _store.enqueue(id: _uuid.v4(), text: text);
+        await _purgeWaiting();
+        await _store.enqueue(id: id, text: text, createdAt: createdAt);
+        _pendingDeadlines[id] = queueDeadline;
         await _reloadOutbox();
       });
 
@@ -904,6 +836,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
   void _toggleTestConnection() {
     if (_manualOffline || (!_connected && !_connecting)) {
       _manualOffline = false;
+      _retryEnabled = true;
       _connect();
     } else {
       _manualOffline = true;
@@ -955,13 +888,13 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
               ),
               const SizedBox(height: 20),
               const Text(
-                '• Messages expire 30 seconds after the test relay '
+                '• Messages expire 30 seconds after the relay '
                 'accepts them.\n\n'
                 '• Offline messages wait in local storage. '
-                'Their countdown has not started.\n\n'
+                'They are dropped 30 seconds after Send if still unsent.\n\n'
                 '• Screenshots and copies are possible.\n\n'
                 '• This prototype clears accepted messages when hidden '
-                'or restarted. Unsent messages remain queued.\n\n'
+                'or restarted. Unsent messages have a 30-second queue limit.\n\n'
                 '• Cleanup cannot execute while the app is killed '
                 'or the phone is off.',
                 style: TextStyle(fontSize: 15, height: 1.5),
@@ -1073,7 +1006,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: const Text(
-                      'Messages expire 30 seconds after the test relay '
+                      'Messages expire 30 seconds after the relay '
                       'accepts them.\n\n'
                       'Screenshots and copies are still possible.',
                       style: TextStyle(color: headingColor, height: 1.5),
@@ -1083,7 +1016,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
                   TextFormField(
                     controller: _name,
                     enabled: !_connecting && !_saving,
-                    maxLength: 24,
+                    maxLength: 30,
                     textInputAction: TextInputAction.go,
                     decoration: const InputDecoration(
                       labelText: 'Display name',
@@ -1091,8 +1024,8 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
                     ),
                     validator: (value) {
                       final name = value?.trim() ?? '';
-                      if (name.isEmpty || name.length > 24) {
-                        return 'Enter a name between 1 and 24 characters.';
+                      if (name.isEmpty || name.runes.length > 30) {
+                        return 'Enter a name between 1 and 30 characters.';
                       }
                       return null;
                     },
@@ -1125,7 +1058,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
                   const SizedBox(height: 12),
                   const Center(
                     child: Text(
-                      'Local development relay · dev-v1',
+                      'Shared relay · protocol 1',
                       style: TextStyle(fontSize: 12, color: secondaryColor),
                     ),
                   ),
@@ -1183,7 +1116,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
               ),
               const SizedBox(height: 5),
               Text(
-                '${own ? (message.recipients.isEmpty ? 'Sent · ' : 'Delivered to ${message.recipients.length} devices · ') : ''}'
+                '${own ? (message.deliveryCount == null ? 'Sent · ' : 'Relay reports ${message.deliveryCount} deliveries · ') : ''}'
                 '${seconds}s left',
                 style: TextStyle(
                   fontSize: 12,
@@ -1265,8 +1198,8 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
                               const SizedBox(height: 5),
                               Text(
                                 waiting
-                                    ? 'Waiting — timer has not started'
-                                    : 'Checking delivery…',
+                                    ? 'Waiting — drops after 30 seconds'
+                                    : 'Sending — awaiting relay echo…',
                                 style: const TextStyle(
                                   fontSize: 12,
                                   color: secondaryColor,
@@ -1433,7 +1366,7 @@ class _VanishHomeState extends State<VanishHome> with WidgetsBindingObserver {
                                 : 'Queue a message…',
                             counterText: _draft.text.isEmpty
                                 ? ''
-                                : '${_draft.text.length}/500',
+                                : '${_draft.text.runes.length}/500',
                           ),
                         ),
                       ),
